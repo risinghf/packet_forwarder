@@ -2,7 +2,7 @@
 
 APP_NAME := basic_pkt_fwd
 
-### Environment constants 
+### Environment constants
 
 LGW_PATH ?= ../../lora_gateway/libloragw
 ARCH ?=
@@ -37,7 +37,7 @@ LGW_INC += $(LGW_PATH)/inc/loragw_hal.h
 
 ### Linking options
 
-LIBS := -lloragw -lrt -lpthread
+LIBS := -lloragw -lrt -lpthread -lm
 
 ### General build targets
 
