@@ -1117,6 +1117,22 @@ int main(void)
     exit(EXIT_SUCCESS);
 }
 
+int lgw_check(void)
+{
+    int32_t tmp;
+    lgw_reg_r(LGW_RADIO_A_EN, &tmp);
+    if(tmp != 1){
+       return -1;
+    }
+
+    lgw_reg_r(LGW_RADIO_B_EN, &tmp);
+    if(tmp != 1){
+       return -1;
+    }
+
+    return 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 1: RECEIVING PACKETS AND FORWARDING THEM ---------------------- */
 
@@ -1171,6 +1187,11 @@ void thread_up(void) {
         /* fetch packets */
         pthread_mutex_lock(&mx_concent);
         nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
+       if(lgw_check()<0){
+           if(lgw_start() == LGW_HAL_SUCCESS) {
+               MSG("LORA RESTART\n");
+           }
+       }
         pthread_mutex_unlock(&mx_concent);
         if (nb_pkt == LGW_HAL_ERROR) {
             MSG("ERROR: [up] failed packet fetch, exiting\n");
