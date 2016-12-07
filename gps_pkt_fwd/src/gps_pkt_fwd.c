@@ -9,10 +9,9 @@
 Description:
     Configure Lora concentrator and forward packets to a server
     Use GPS for packet timestamping.
-    Send a becon at a regular interval without server intervention
 
 License: Revised BSD License, see LICENSE.TXT file include in the project
-Maintainer: Michael Coracin
+Maintainer: Sylvain Miermont
 */
 
 
@@ -26,36 +25,32 @@ Maintainer: Michael Coracin
     #define _XOPEN_SOURCE 500
 #endif
 
-#include <stdint.h>         /* C99 types */
-#include <stdbool.h>        /* bool type */
-#include <stdio.h>          /* printf, fprintf, snprintf, fopen, fputs */
+#include <stdint.h>     /* C99 types */
+#include <stdbool.h>    /* bool type */
+#include <stdio.h>      /* printf, fprintf, snprintf, fopen, fputs */
 
-#include <string.h>         /* memset */
-#include <signal.h>         /* sigaction */
-#include <time.h>           /* time, clock_gettime, strftime, gmtime */
-#include <sys/time.h>       /* timeval */
-#include <unistd.h>         /* getopt, access */
-#include <stdlib.h>         /* atoi, exit */
-#include <errno.h>          /* error messages */
-#include <math.h>           /* modf */
-#include <assert.h>
+#include <string.h>     /* memset */
+#include <signal.h>     /* sigaction */
+#include <time.h>       /* time, clock_gettime, strftime, gmtime */
+#include <sys/time.h>   /* timeval */
+#include <unistd.h>     /* getopt, access */
+#include <stdlib.h>     /* atoi, exit */
+#include <errno.h>      /* error messages */
+#include <math.h>       /* modf */
 
-#include <sys/socket.h>     /* socket specific definitions */
-#include <netinet/in.h>     /* INET constants and stuff */
-#include <arpa/inet.h>      /* IP address conversion stuff */
-#include <netdb.h>          /* gai_strerror */
+#include <sys/socket.h> /* socket specific definitions */
+#include <netinet/in.h> /* INET constants and stuff */
+#include <arpa/inet.h>  /* IP address conversion stuff */
+#include <netdb.h>      /* gai_strerror */
 
 #include <pthread.h>
 
-#include "trace.h"
-#include "jitqueue.h"
-#include "timersync.h"
 #include "parson.h"
 #include "base64.h"
+#include "loragw_reg.h"
 #include "loragw_hal.h"
 #include "loragw_gps.h"
 #include "loragw_aux.h"
-#include "loragw_reg.h"
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE MACROS ------------------------------------------------------- */
@@ -63,6 +58,8 @@ Maintainer: Michael Coracin
 #define ARRAY_SIZE(a)   (sizeof(a) / sizeof((a)[0]))
 #define STRINGIFY(x)    #x
 #define STR(x)          STRINGIFY(x)
+#define MSG(args...)    printf(args) /* message that is destined to the user */
+#define TRACE()         fprintf(stderr, "@ %s %d\n", __FUNCTION__, __LINE__);
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE CONSTANTS ---------------------------------------------------- */
@@ -71,28 +68,23 @@ Maintainer: Michael Coracin
   #define VERSION_STRING "undefined"
 #endif
 
-#define DEFAULT_SERVER      127.0.0.1   /* hostname also supported */
+#define DEFAULT_SERVER      127.0.0.1 /* hostname also supported */
 #define DEFAULT_PORT_UP     1780
 #define DEFAULT_PORT_DW     1782
-#define DEFAULT_KEEPALIVE   5           /* default time interval for downstream keep-alive packet */
-#define DEFAULT_STAT        30          /* default time interval for statistics */
+#define DEFAULT_KEEPALIVE   5   /* default time interval for downstream keep-alive packet */
+#define DEFAULT_STAT        30  /* default time interval for statistics */
 #define PUSH_TIMEOUT_MS     100
 #define PULL_TIMEOUT_MS     200
-#define GPS_REF_MAX_AGE     30          /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
-#define FETCH_SLEEP_MS      10          /* nb of ms waited when a fetch return no packets */
-#define BEACON_POLL_MS      50          /* time in ms between polling of beacon TX status */
+#define GPS_REF_MAX_AGE     30  /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
+#define FETCH_SLEEP_MS      10  /* nb of ms waited when a fetch return no packets */
 
-#define PROTOCOL_VERSION    2           /* v1.3 */
-
-#define XERR_INIT_AVG       128         /* nb of measurements the XTAL correction is averaged on as initial value */
-#define XERR_FILT_COEF      256         /* coefficient for low-pass XTAL error tracking */
+#define PROTOCOL_VERSION    1
 
 #define PKT_PUSH_DATA   0
 #define PKT_PUSH_ACK    1
 #define PKT_PULL_DATA   2
 #define PKT_PULL_RESP   3
 #define PKT_PULL_ACK    4
-#define PKT_TX_ACK      5
 
 #define NB_PKT_MAX      8 /* max number of packets per fetch/send cycle */
 
@@ -139,22 +131,19 @@ static struct timeval push_timeout_half = {0, (PUSH_TIMEOUT_MS * 500)}; /* cut i
 static struct timeval pull_timeout = {0, (PULL_TIMEOUT_MS * 1000)}; /* non critical for throughput */
 
 /* hardware access control and correction */
-pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
-static pthread_mutex_t mx_xcorr = PTHREAD_MUTEX_INITIALIZER; /* control access to the XTAL correction */
-static bool xtal_correct_ok = false; /* set true when XTAL correction is stable enough */
-static double xtal_correct = 1.0;
+static pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
 
 /* GPS configuration and synchronization */
-static char gps_tty_path[64] = "\0"; /* path of the TTY port GPS is connected on */
-static int gps_tty_fd = -1; /* file descriptor of the GPS TTY port */
-static bool gps_enabled = false; /* is GPS enabled on that gateway ? */
+static char gps_tty_path[64]; /* path of the TTY port GPS is connected on */
+static int gps_tty_fd; /* file descriptor of the GPS TTY port */
+static bool gps_enabled; /* is GPS enabled on that gateway ? */
 
 /* GPS time reference */
 static pthread_mutex_t mx_timeref = PTHREAD_MUTEX_INITIALIZER; /* control access to GPS time reference */
 static bool gps_ref_valid; /* is GPS reference acceptable (ie. not too old) */
 static struct tref time_reference_gps; /* time reference used for UTC <-> timestamp conversion */
 
-/* Reference coordinates, for broadcasting (beacon) */
+/* Reference coordinates, to send in status instead of GPS coordiantes if 'fake' is enabled */
 static struct coord_s reference_coord;
 
 /* Enable faking the GPS coordinates of the gateway */
@@ -180,14 +169,6 @@ static uint32_t meas_dw_network_byte = 0; /* sum of UDP bytes sent for upstream 
 static uint32_t meas_dw_payload_byte = 0; /* sum of radio payload bytes sent for upstream traffic */
 static uint32_t meas_nb_tx_ok = 0; /* count packets emitted successfully */
 static uint32_t meas_nb_tx_fail = 0; /* count packets were TX failed for other reasons */
-static uint32_t meas_nb_tx_requested = 0; /* count TX request from server (downlinks) */
-static uint32_t meas_nb_tx_rejected_collision_packet = 0; /* count packets were TX request were rejected due to collision with another packet already programmed */
-static uint32_t meas_nb_tx_rejected_collision_beacon = 0; /* count packets were TX request were rejected due to collision with a beacon already programmed */
-static uint32_t meas_nb_tx_rejected_too_late = 0; /* count packets were TX request were rejected because it is too late to program it */
-static uint32_t meas_nb_tx_rejected_too_early = 0; /* count packets were TX request were rejected because timestamp is too much in advance */
-static uint32_t meas_nb_beacon_queued = 0; /* count beacon inserted in jit queue */
-static uint32_t meas_nb_beacon_sent = 0; /* count beacon actually sent to concentrator */
-static uint32_t meas_nb_beacon_rejected = 0; /* count beacon rejected for queuing */
 
 static pthread_mutex_t mx_meas_gps = PTHREAD_MUTEX_INITIALIZER; /* control access to the GPS statistics */
 static bool gps_coord_valid; /* could we get valid GPS coordinates ? */
@@ -198,18 +179,14 @@ static pthread_mutex_t mx_stat_rep = PTHREAD_MUTEX_INITIALIZER; /* control acces
 static bool report_ready = false; /* true when there is a new report to send to the server */
 static char status_report[STATUS_SIZE]; /* status report as a JSON object */
 
-/* beacon parameters */
-static uint32_t beacon_period = 0; /* set beaconing period, must be a sub-multiple of 86400, the nb of sec in a day */
-static uint32_t beacon_freq_hz = 0; /* TX beacon frequency, in Hz */
-
 /* auto-quit function */
 static uint32_t autoquit_threshold = 0; /* enable auto-quit after a number of non-acknowledged PULL_DATA (0 = disabled)*/
 
-/* Just In Time TX scheduling */
-static struct jit_queue_s jit_queue;
-
 /* Gateway specificities */
 static int8_t antenna_gain = 0;
+
+/* Japan 920 Class J flag*/
+static bool jp920_datarate = false;
 
 /* TX capabilities */
 static struct lgw_tx_gain_lut_s txlut; /* TX gain table */
@@ -225,8 +202,6 @@ static int parse_SX1301_configuration(const char * conf_file);
 
 static int parse_gateway_configuration(const char * conf_file);
 
-static uint16_t crc_ccit(const uint8_t * data, unsigned size);
-
 static double difftimespec(struct timespec end, struct timespec beginning);
 
 /* threads */
@@ -234,15 +209,13 @@ void thread_up(void);
 void thread_down(void);
 void thread_gps(void);
 void thread_valid(void);
-void thread_jit(void);
-void thread_timersync(void);
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DEFINITION ----------------------------------------- */
 
 static void sig_handler(int sigio) {
     if (sigio == SIGQUIT) {
-        quit_sig = true;
+        quit_sig = true;;
     } else if ((sigio == SIGINT) || (sigio == SIGTERM)) {
         exit_sig = true;
     }
@@ -258,7 +231,11 @@ static int parse_SX1301_configuration(const char * conf_file) {
     JSON_Object *conf_obj = NULL;
     JSON_Value *val = NULL;
     struct lgw_conf_board_s boardconf;
+
+#if 0
     struct lgw_conf_lbt_s lbtconf;
+#endif
+
     struct lgw_conf_rxrf_s rfconf;
     struct lgw_conf_rxif_s ifconf;
     uint32_t sf, bw, fdev;
@@ -297,10 +274,19 @@ static int parse_SX1301_configuration(const char * conf_file) {
     }
     MSG("INFO: lorawan_public %d, clksrc %d\n", boardconf.lorawan_public, boardconf.clksrc);
     /* all parameters parsed, submitting configuration to the HAL */
-    if (lgw_board_setconf(boardconf) != LGW_HAL_SUCCESS) {
-        MSG("WARNING: Failed to configure board\n");
+        if (lgw_board_setconf(boardconf) != LGW_HAL_SUCCESS) {
+                MSG("WARNING: Failed to configure board\n");
     }
 
+    val = json_object_get_value(conf_obj, "jp920_datarate");
+    if (json_value_get_type(val) == JSONBoolean) {
+        MSG("Japan 920 datarate scheme is enabled\n");
+        jp920_datarate = (bool)json_value_get_boolean(val);
+    } else {
+        jp920_datarate = false;
+    }
+
+#if 0
     /* LBT struct*/
     memset(&lbtconf, 0, sizeof lbtconf); /* initialize configuration structure */
     val = json_object_get_value(conf_obj, "lbt_cfg"); /* fetch value (if possible) */
@@ -361,6 +347,7 @@ static int parse_SX1301_configuration(const char * conf_file) {
     if (lgw_lbt_setconf(lbtconf) != LGW_HAL_SUCCESS) {
         MSG("WARNING: Failed to configure lbt\n");
     }
+#endif
 
     /* set antenna gain configuration */
     val = json_object_get_value(conf_obj, "antenna_gain"); /* fetch value (if possible) */
@@ -730,20 +717,6 @@ static int parse_gateway_configuration(const char * conf_file) {
         }
     }
 
-    /* Beacon signal period (optional) */
-    val = json_object_get_value(conf_obj, "beacon_period");
-    if (val != NULL) {
-        beacon_period = (uint32_t)json_value_get_number(val);
-        MSG("INFO: Beaconing period is configured to %u seconds\n", beacon_period);
-    }
-
-    /* Beacon TX frequency (optional) */
-    val = json_object_get_value(conf_obj, "beacon_freq_hz");
-    if (val != NULL) {
-        beacon_freq_hz = (uint32_t)json_value_get_number(val);
-        MSG("INFO: Beaconing signal will be emitted at %u Hz\n", beacon_freq_hz);
-    }
-
     /* Auto-quit threshold (optional) */
     val = json_object_get_value(conf_obj, "autoquit_threshold");
     if (val != NULL) {
@@ -756,48 +729,6 @@ static int parse_gateway_configuration(const char * conf_file) {
     return 0;
 }
 
-static uint16_t crc_ccit(const uint8_t * data, unsigned size) {
-    const uint16_t crc_poly = 0x1021; /* CCITT */
-    const uint16_t init_val = 0xFFFF; /* CCITT */
-    uint16_t x = init_val;
-    unsigned i, j;
-
-    if (data == NULL)  {
-        return 0;
-    }
-
-    for (i=0; i<size; ++i) {
-        x ^= (uint16_t)data[i] << 8;
-        for (j=0; j<8; ++j) {
-            x = (x & 0x8000) ? (x<<1) ^ crc_poly : (x<<1);
-        }
-    }
-
-    return x;
-}
-
-#if 0
-static uint8_t crc8_ccit(const uint8_t * data, unsigned size) {
-    const uint8_t crc_poly = 0x87; /* CCITT */
-    const uint8_t init_val = 0xFF; /* CCITT */
-    uint8_t x = init_val;
-    unsigned i, j;
-
-    if (data == NULL)  {
-        return 0;
-    }
-
-    for (i=0; i<size; ++i) {
-        x ^= data[i];
-        for (j=0; j<8; ++j) {
-            x = (x & 0x80) ? (x<<1) ^ crc_poly : (x<<1);
-        }
-    }
-
-    return x;
-}
-#endif
-
 static double difftimespec(struct timespec end, struct timespec beginning) {
     double x;
 
@@ -805,92 +736,6 @@ static double difftimespec(struct timespec end, struct timespec beginning) {
     x += (double)(end.tv_sec - beginning.tv_sec);
 
     return x;
-}
-
-static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error) {
-    uint8_t buff_ack[64]; /* buffer to give feedback to server */
-    int buff_index;
-
-    /* reset buffer */
-    memset(&buff_ack, 0, sizeof buff_ack);
-
-    /* Prepare downlink feedback to be sent to server */
-    buff_ack[0] = PROTOCOL_VERSION;
-    buff_ack[1] = token_h;
-    buff_ack[2] = token_l;
-    buff_ack[3] = PKT_TX_ACK;
-    *(uint32_t *)(buff_ack + 4) = net_mac_h;
-    *(uint32_t *)(buff_ack + 8) = net_mac_l;
-    buff_index = 12; /* 12-byte header */
-
-    /* Put no JSON string if there is nothing to report */
-    if (error != JIT_ERROR_OK) {
-        /* start of JSON structure */
-        memcpy((void *)(buff_ack + buff_index), (void *)"{\"txpk_ack\":{", 13);
-        buff_index += 13;
-        /* set downlink error status in JSON structure */
-        memcpy((void *)(buff_ack + buff_index), (void *)"\"error\":", 8);
-        buff_index += 8;
-        switch (error) {
-            case JIT_ERROR_FULL:
-            case JIT_ERROR_COLLISION_PACKET:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"COLLISION_PACKET\"", 18);
-                buff_index += 18;
-                /* update stats */
-                pthread_mutex_lock(&mx_meas_dw);
-                meas_nb_tx_rejected_collision_packet += 1;
-                pthread_mutex_unlock(&mx_meas_dw);
-                break;
-            case JIT_ERROR_TOO_LATE:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"TOO_LATE\"", 10);
-                buff_index += 10;
-                /* update stats */
-                pthread_mutex_lock(&mx_meas_dw);
-                meas_nb_tx_rejected_too_late += 1;
-                pthread_mutex_unlock(&mx_meas_dw);
-                break;
-            case JIT_ERROR_TOO_EARLY:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"TOO_EARLY\"", 11);
-                buff_index += 11;
-                /* update stats */
-                pthread_mutex_lock(&mx_meas_dw);
-                meas_nb_tx_rejected_too_early += 1;
-                pthread_mutex_unlock(&mx_meas_dw);
-                break;
-            case JIT_ERROR_COLLISION_BEACON:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"COLLISION_BEACON\"", 18);
-                buff_index += 18;
-                /* update stats */
-                pthread_mutex_lock(&mx_meas_dw);
-                meas_nb_tx_rejected_collision_beacon += 1;
-                pthread_mutex_unlock(&mx_meas_dw);
-                break;
-            case JIT_ERROR_TX_FREQ:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"TX_FREQ\"", 9);
-                buff_index += 9;
-                break;
-            case JIT_ERROR_TX_POWER:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"TX_POWER\"", 10);
-                buff_index += 10;
-                break;
-            case JIT_ERROR_GPS_UNLOCKED:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"GPS_UNLOCKED\"", 14);
-                buff_index += 14;
-                break;
-            default:
-                memcpy((void *)(buff_ack + buff_index), (void *)"\"UNKNOWN\"", 9);
-                buff_index += 9;
-                break;
-        }
-        /* end of JSON structure */
-        memcpy((void *)(buff_ack + buff_index), (void *)"}}", 2);
-        buff_index += 2;
-    }
-
-    buff_ack[buff_index] = 0; /* add string terminator, for safety */
-
-    /* send datagram to server */
-    return send(sock_down, (void *)buff_ack, buff_index, 0);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -911,8 +756,6 @@ int main(void)
     pthread_t thrid_down;
     pthread_t thrid_gps;
     pthread_t thrid_valid;
-    pthread_t thrid_jit;
-    pthread_t thrid_timersync;
 
     /* network socket creation */
     struct addrinfo hints;
@@ -938,14 +781,6 @@ int main(void)
     uint32_t cp_dw_payload_byte;
     uint32_t cp_nb_tx_ok;
     uint32_t cp_nb_tx_fail;
-    uint32_t cp_nb_tx_requested = 0;
-    uint32_t cp_nb_tx_rejected_collision_packet = 0;
-    uint32_t cp_nb_tx_rejected_collision_beacon = 0;
-    uint32_t cp_nb_tx_rejected_too_late = 0;
-    uint32_t cp_nb_tx_rejected_too_early = 0;
-    uint32_t cp_nb_beacon_queued = 0;
-    uint32_t cp_nb_beacon_sent = 0;
-    uint32_t cp_nb_beacon_rejected = 0;
 
     /* GPS coordinates variables */
     bool coord_ok = false;
@@ -962,7 +797,7 @@ int main(void)
     float dw_ack_ratio;
 
     /* display version informations */
-    MSG("*** Beacon Packet Forwarder for Lora Gateway ***\nVersion: " VERSION_STRING "\n");
+    MSG("*** GPS Packet Forwarder for Lora Gateway ***\nVersion: " VERSION_STRING "\n");
     MSG("*** Lora concentrator HAL library version info ***\n%s\n***\n", lgw_version_info());
 
     /* display host endianness */
@@ -1000,17 +835,15 @@ int main(void)
     }
 
     /* Start GPS a.s.a.p., to allow it to lock */
-    if (gps_tty_path[0] != '\0') { /* do not try to open GPS device if no path set */
-        i = lgw_gps_enable(gps_tty_path, "ubx7", 0, &gps_tty_fd); /* HAL only supports u-blox 7 for now */
-        if (i != LGW_GPS_SUCCESS) {
-            printf("WARNING: [main] impossible to open %s for GPS sync (check permissions)\n", gps_tty_path);
-            gps_enabled = false;
-            gps_ref_valid = false;
-        } else {
-            printf("INFO: [main] TTY port %s open for GPS synchronization\n", gps_tty_path);
-            gps_enabled = true;
-            gps_ref_valid = false;
-        }
+    i = lgw_gps_enable(gps_tty_path, NULL, 0, &gps_tty_fd);
+    if (i != LGW_GPS_SUCCESS) {
+        printf("WARNING: [main] impossible to open %s for GPS sync (check permissions)\n", gps_tty_path);
+        gps_enabled = false;
+        gps_ref_valid = false;
+    } else {
+        printf("INFO: [main] TTY port %s open for GPS synchronization\n", gps_tty_path);
+        gps_enabled = true;
+        gps_ref_valid = false;
     }
 
     /* get timezone info */
@@ -1059,6 +892,7 @@ int main(void)
         exit(EXIT_FAILURE);
     }
     freeaddrinfo(result);
+
 
     /* look for server address w/ downstream port */
     i = getaddrinfo(serv_addr, serv_port_down, &hints, &result);
@@ -1110,16 +944,6 @@ int main(void)
     i = pthread_create( &thrid_down, NULL, (void * (*)(void *))thread_down, NULL);
     if (i != 0) {
         MSG("ERROR: [main] impossible to create downstream thread\n");
-        exit(EXIT_FAILURE);
-    }
-    i = pthread_create( &thrid_jit, NULL, (void * (*)(void *))thread_jit, NULL);
-    if (i != 0) {
-        MSG("ERROR: [main] impossible to create JIT thread\n");
-        exit(EXIT_FAILURE);
-    }
-    i = pthread_create( &thrid_timersync, NULL, (void * (*)(void *))thread_timersync, NULL);
-    if (i != 0) {
-        MSG("ERROR: [main] impossible to create Timer Sync thread\n");
         exit(EXIT_FAILURE);
     }
 
@@ -1199,14 +1023,6 @@ int main(void)
         cp_dw_payload_byte =  meas_dw_payload_byte;
         cp_nb_tx_ok        =  meas_nb_tx_ok;
         cp_nb_tx_fail      =  meas_nb_tx_fail;
-        cp_nb_tx_requested                 +=  meas_nb_tx_requested;
-        cp_nb_tx_rejected_collision_packet +=  meas_nb_tx_rejected_collision_packet;
-        cp_nb_tx_rejected_collision_beacon +=  meas_nb_tx_rejected_collision_beacon;
-        cp_nb_tx_rejected_too_late         +=  meas_nb_tx_rejected_too_late;
-        cp_nb_tx_rejected_too_early        +=  meas_nb_tx_rejected_too_early;
-        cp_nb_beacon_queued   +=  meas_nb_beacon_queued;
-        cp_nb_beacon_sent     +=  meas_nb_beacon_sent;
-        cp_nb_beacon_rejected +=  meas_nb_beacon_rejected;
         meas_dw_pull_sent = 0;
         meas_dw_ack_rcv = 0;
         meas_dw_dgram_rcv = 0;
@@ -1214,14 +1030,6 @@ int main(void)
         meas_dw_payload_byte = 0;
         meas_nb_tx_ok = 0;
         meas_nb_tx_fail = 0;
-        meas_nb_tx_requested = 0;
-        meas_nb_tx_rejected_collision_packet = 0;
-        meas_nb_tx_rejected_collision_beacon = 0;
-        meas_nb_tx_rejected_too_late = 0;
-        meas_nb_tx_rejected_too_early = 0;
-        meas_nb_beacon_queued = 0;
-        meas_nb_beacon_sent = 0;
-        meas_nb_beacon_rejected = 0;
         pthread_mutex_unlock(&mx_meas_dw);
         if (cp_dw_pull_sent > 0) {
             dw_ack_ratio = (float)cp_dw_ack_rcv / (float)cp_dw_pull_sent;
@@ -1258,17 +1066,6 @@ int main(void)
         printf("# PULL_RESP(onse) datagrams received: %u (%u bytes)\n", cp_dw_dgram_rcv, cp_dw_network_byte);
         printf("# RF packets sent to concentrator: %u (%u bytes)\n", (cp_nb_tx_ok+cp_nb_tx_fail), cp_dw_payload_byte);
         printf("# TX errors: %u\n", cp_nb_tx_fail);
-        if (cp_nb_tx_requested != 0 ) {
-            printf("# TX rejected (collision packet): %.2f%% (req:%u, rej:%u)\n", 100.0 * cp_nb_tx_rejected_collision_packet / cp_nb_tx_requested, cp_nb_tx_requested, cp_nb_tx_rejected_collision_packet);
-            printf("# TX rejected (collision beacon): %.2f%% (req:%u, rej:%u)\n", 100.0 * cp_nb_tx_rejected_collision_beacon / cp_nb_tx_requested, cp_nb_tx_requested, cp_nb_tx_rejected_collision_beacon);
-            printf("# TX rejected (too late): %.2f%% (req:%u, rej:%u)\n", 100.0 * cp_nb_tx_rejected_too_late / cp_nb_tx_requested, cp_nb_tx_requested, cp_nb_tx_rejected_too_late);
-            printf("# TX rejected (too early): %.2f%% (req:%u, rej:%u)\n", 100.0 * cp_nb_tx_rejected_too_early / cp_nb_tx_requested, cp_nb_tx_requested, cp_nb_tx_rejected_too_early);
-        }
-        printf("# BEACON queued: %u\n", cp_nb_beacon_queued);
-        printf("# BEACON sent so far: %u\n", cp_nb_beacon_sent);
-        printf("# BEACON rejected: %u\n", cp_nb_beacon_rejected);
-        printf("### [JIT] ###\n");
-        jit_print_queue (&jit_queue, false, DEBUG_LOG);
         printf("### [GPS] ###\n");
         if (gps_enabled == true) {
             /* no need for mutex, display is not critical */
@@ -1288,6 +1085,7 @@ int main(void)
             printf("# GPS sync is disabled\n");
         }
         printf("##### END #####\n");
+        fflush(stdout);
 
         /* generate a JSON report (will be sent to server by upstream thread) */
         pthread_mutex_lock(&mx_stat_rep);
@@ -1303,8 +1101,6 @@ int main(void)
     /* wait for upstream thread to finish (1 fetch cycle max) */
     pthread_join(thrid_up, NULL);
     pthread_cancel(thrid_down); /* don't wait for downstream thread */
-    pthread_cancel(thrid_jit); /* don't wait for jit thread */
-    pthread_cancel(thrid_timersync); /* don't wait for timer sync thread */
     if (gps_enabled == true) {
         pthread_cancel(thrid_gps); /* don't wait for GPS thread */
         pthread_cancel(thrid_valid); /* don't wait for validation thread */
@@ -1328,8 +1124,6 @@ int main(void)
     exit(EXIT_SUCCESS);
 }
 
-/* -------------------------------------------------------------------------- */
-/* --- THREAD 1: RECEIVING PACKETS AND FORWARDING THEM ---------------------- */
 int lgw_check(void)
 {
     int32_t tmp;
@@ -1345,6 +1139,9 @@ int lgw_check(void)
 
     return 0;
 }
+
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 1: RECEIVING PACKETS AND FORWARDING THEM ---------------------- */
 
 void thread_up(void) {
     int i, j; /* loop variables */
@@ -1379,10 +1176,6 @@ void thread_up(void) {
     /* report management variable */
     bool send_report = false;
 
-    /* mote info variables */
-    uint32_t mote_addr = 0;
-    uint16_t mote_fcnt = 0;
-
     /* set upstream socket RX timeout */
     i = setsockopt(sock_up, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
     if (i != 0) {
@@ -1401,11 +1194,11 @@ void thread_up(void) {
         /* fetch packets */
         pthread_mutex_lock(&mx_concent);
         nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
-        if(lgw_check()<0){
+       if(lgw_check()<0){
            if(lgw_start() == LGW_HAL_SUCCESS) {
                MSG("LORA RESTART\n");
-            }
-        }
+           }
+       }
         pthread_mutex_unlock(&mx_concent);
         if (nb_pkt == LGW_HAL_ERROR) {
             MSG("ERROR: [up] failed packet fetch, exiting\n");
@@ -1448,23 +1241,12 @@ void thread_up(void) {
         for (i=0; i < nb_pkt; ++i) {
             p = &rxpkt[i];
 
-            /* Get mote information from current packet (addr, fcnt) */
-            /* FHDR - DevAddr */
-            mote_addr  = p->payload[1];
-            mote_addr |= p->payload[2] << 8;
-            mote_addr |= p->payload[3] << 16;
-            mote_addr |= p->payload[4] << 24;
-            /* FHDR - FCnt */
-            mote_fcnt  = p->payload[6];
-            mote_fcnt |= p->payload[7] << 8;
-
             /* basic packet filtering */
             pthread_mutex_lock(&mx_meas_up);
             meas_nb_rx_rcv += 1;
             switch(p->status) {
                 case STAT_CRC_OK:
                     meas_nb_rx_ok += 1;
-                    printf( "\nINFO: Received pkt from mote: %08X (fcnt=%u)\n", mote_addr, mote_fcnt );
                     if (!fwd_valid_pkt) {
                         pthread_mutex_unlock(&mx_meas_up);
                         continue; /* skip that packet */
@@ -1680,6 +1462,15 @@ void thread_up(void) {
                 exit(EXIT_FAILURE);
             }
 
+            {
+                int k;
+                printf("RX: ");
+                for(k=0; k<p->size; k++){
+                    printf("%02X ", p->payload[k]);
+                }
+                printf("\n");
+            }
+
             /* Packet base64-encoded payload, 14-350 useful chars */
             memcpy((void *)(buff_up + buff_index), (void *)",\"data\":\"", 9);
             buff_index += 9;
@@ -1775,7 +1566,7 @@ void thread_up(void) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* --- THREAD 2: POLLING SERVER AND ENQUEUING PACKETS IN JIT QUEUE ---------- */
+/* --- THREAD 2: POLLING SERVER AND EMITTING PACKETS ------------------------ */
 
 void thread_down(void) {
     int i; /* loop variables */
@@ -1812,28 +1603,8 @@ void thread_down(void) {
     struct tm utc_vector; /* for collecting the elements of the UTC time */
     struct timespec utc_tx; /* UTC time that needs to be converted to timestamp */
 
-    /* beacon variables */
-    struct lgw_pkt_tx_s beacon_pkt;
-    uint8_t beacon_loop;
-    time_t diff_beacon_time;
-    struct timespec next_beacon_gps_time; /* gps time of next beacon packet */
-    struct timespec last_beacon_gps_time; /* gps time of last enqueued beacon packet */
-    int retry;
-
-    /* beacon data fields, byte 0 is Least Significant Byte */
-    uint8_t field_info = 0;
-    int32_t field_latitude; /* 3 bytes, derived from reference latitude */
-    int32_t field_longitude; /* 3 bytes, derived from reference longitude */
-    uint16_t field_crc1, field_crc2;
-
     /* auto-quit variable */
     uint32_t autoquit_cnt = 0; /* count the number of PULL_DATA sent since the latest PULL_ACK */
-
-    /* Just In Time downlink */
-    struct timeval current_unix_time;
-    struct timeval current_concentrator_time;
-    enum jit_error_e jit_result = JIT_ERROR_OK;
-    enum jit_pkt_type_e downlink_type;
 
     /* set downstream socket RX timeout */
     i = setsockopt(sock_down, SOL_SOCKET, SO_RCVTIMEO, (void *)&pull_timeout, sizeof pull_timeout);
@@ -1847,56 +1618,6 @@ void thread_down(void) {
     buff_req[3] = PKT_PULL_DATA;
     *(uint32_t *)(buff_req + 4) = net_mac_h;
     *(uint32_t *)(buff_req + 8) = net_mac_l;
-
-    /* beacon variables initialization */
-    last_beacon_gps_time.tv_sec = 0;
-    last_beacon_gps_time.tv_nsec = 0;
-
-    /* beacon packet parameters */
-    beacon_pkt.tx_mode = ON_GPS; /* send on PPS pulse */
-    beacon_pkt.rf_chain = 0; /* antenna A */
-    beacon_pkt.rf_power = 14;
-    beacon_pkt.modulation = MOD_LORA;
-    beacon_pkt.bandwidth = BW_125KHZ;
-    beacon_pkt.datarate = DR_LORA_SF9;
-    beacon_pkt.coderate = CR_LORA_4_5;
-    beacon_pkt.invert_pol = false;
-    beacon_pkt.preamble = 10;
-    beacon_pkt.no_crc = true;
-    beacon_pkt.no_header = true;
-    beacon_pkt.size = 17;
-
-    /* fixed bacon fields (little endian) */
-    beacon_pkt.payload[0] = 0x0; /* RFU */
-    beacon_pkt.payload[1] = 0x0; /* RFU */
-    /* 2-5 : time (variable) */
-    /* 6-7 : crc1 (variable) */
-
-    /* calculate the latitude and longitude that must be publicly reported */
-    field_latitude = (int32_t)((reference_coord.lat / 90.0) * (double)(1<<23));
-    if (field_latitude > (int32_t)0x007FFFFF) {
-        field_latitude = (int32_t)0x007FFFFF; /* +90 N is represented as 89.99999 N */
-    } else if (field_latitude < (int32_t)0xFF800000) {
-        field_latitude = (int32_t)0xFF800000;
-    }
-    field_longitude = 0x00FFFFFF & (int32_t)((reference_coord.lon / 180.0) * (double)(1<<23)); /* +180 = -180 = 0x800000 */
-
-    /* optional beacon fields */
-    beacon_pkt.payload[ 8] = field_info;
-    beacon_pkt.payload[ 9] = 0xFF &  field_latitude;
-    beacon_pkt.payload[10] = 0xFF & (field_latitude >>  8);
-    beacon_pkt.payload[11] = 0xFF & (field_latitude >> 16);
-    beacon_pkt.payload[12] = 0xFF &  field_longitude;
-    beacon_pkt.payload[13] = 0xFF & (field_longitude >>  8);
-    beacon_pkt.payload[14] = 0xFF & (field_longitude >> 16);
-
-    /* CRC of the optional beacon fileds */
-    field_crc2 = crc_ccit((beacon_pkt.payload + 8), 7);
-    beacon_pkt.payload[15] = 0xFF &  field_crc2;
-    beacon_pkt.payload[16] = 0xFF & (field_crc2 >>  8);
-
-    /* JIT queue initialization */
-    jit_queue_init(&jit_queue);
 
     while (!exit_sig && !quit_sig) {
 
@@ -1930,102 +1651,6 @@ void thread_down(void) {
             msg_len = recv(sock_down, (void *)buff_down, (sizeof buff_down)-1, 0);
             clock_gettime(CLOCK_MONOTONIC, &recv_time);
 
-            /* Pre-allocate beacon slots in JiT queue, to check downlink collisions */
-            beacon_loop = JIT_NUM_BEACON_IN_QUEUE - jit_queue.num_beacon;
-            retry = 0;
-            while (beacon_loop && (beacon_period != 0)) {
-                pthread_mutex_lock(&mx_timeref);
-                /* Wait for GPS to be ready before inserting beacons in JiT queue */
-                if ((gps_ref_valid == true) && (xtal_correct_ok == true)) {
-
-                    /* compute GPS time for next beacon to come    */
-                    /*   LoRaWAN: T = k*beacon_period + TBeaconDelay */
-                    /*            with TBeaconDelay = [0:50ms]       */
-                    if (last_beacon_gps_time.tv_sec == 0) {
-                        /* if no beacon has been queued, get next slot from current UTC time */
-                        diff_beacon_time = time_reference_gps.utc.tv_sec % ((time_t)beacon_period);
-                        next_beacon_gps_time.tv_sec = time_reference_gps.utc.tv_sec +
-                                                        ((time_t)beacon_period - diff_beacon_time);
-                    } else {
-                        /* if there is already a beacon, take it as reference */
-                        next_beacon_gps_time.tv_sec = last_beacon_gps_time.tv_sec + beacon_period;
-                    }
-                    /* now we can add a beacon_period to the reference to get next beacon GPS time */
-                    next_beacon_gps_time.tv_sec += (retry * beacon_period);
-                    next_beacon_gps_time.tv_nsec = 0;
-
-                    MSG_DEBUG(DEBUG_BEACON, "GPS-now : %s", ctime(&time_reference_gps.utc.tv_sec));
-                    MSG_DEBUG(DEBUG_BEACON, "GPS-last: %s", ctime(&last_beacon_gps_time.tv_sec));
-                    MSG_DEBUG(DEBUG_BEACON, "GPS-next: %s", ctime(&next_beacon_gps_time.tv_sec));
-
-                    /* convert UTC time to concentrator time, and set packet counter for JiT trigger */
-                    lgw_utc2cnt(time_reference_gps, next_beacon_gps_time, &(beacon_pkt.count_us));
-                    pthread_mutex_unlock(&mx_timeref);
-
-                    /* apply frequency correction to beacon TX frequency */
-                    pthread_mutex_lock(&mx_xcorr);
-                    beacon_pkt.freq_hz = (uint32_t)(xtal_correct * (double)beacon_freq_hz);
-                    pthread_mutex_unlock(&mx_xcorr);
-
-                    /* load time in beacon payload */
-                    beacon_pkt.payload[2] = 0xFF &  next_beacon_gps_time.tv_sec;
-                    beacon_pkt.payload[3] = 0xFF & (next_beacon_gps_time.tv_sec >>  8);
-                    beacon_pkt.payload[4] = 0xFF & (next_beacon_gps_time.tv_sec >> 16);
-                    beacon_pkt.payload[5] = 0xFF & (next_beacon_gps_time.tv_sec >> 24);
-
-                    /* calculate CRC */
-                    field_crc1 = crc_ccit(beacon_pkt.payload, 6); /* CRC for the first 6 bytes */
-                    beacon_pkt.payload[6] = 0xFF & field_crc1;
-                    beacon_pkt.payload[7] = 0xFF & (field_crc1 >> 8);
-
-                    /* Insert beacon packet in JiT queue */
-                    gettimeofday(&current_unix_time, NULL);
-                    get_concentrator_time(&current_concentrator_time, current_unix_time);
-                    jit_result = jit_enqueue(&jit_queue, &current_concentrator_time, &beacon_pkt, JIT_PKT_TYPE_BEACON);
-                    if (jit_result == JIT_ERROR_OK) {
-                        /* update stats */
-                        pthread_mutex_lock(&mx_meas_dw);
-                        meas_nb_beacon_queued += 1;
-                        pthread_mutex_unlock(&mx_meas_dw);
-
-                        /* One more beacon in the queue */
-                        beacon_loop--;
-                        retry = 0;
-                        last_beacon_gps_time.tv_sec = next_beacon_gps_time.tv_sec; /* keep this beacon time as reference for next one to be programmed */
-
-                        /* display beacon payload */
-                        MSG("--- Beacon queued (count_us=%u) - payload: ---\n", beacon_pkt.count_us);
-                        for (i=0; i<24; ++i) {
-                            MSG("0x%02X", beacon_pkt.payload[i]);
-                            if (i%8 == 7) {
-                                MSG("\n");
-                            } else {
-                                MSG(" - ");
-                            }
-                        }
-                        if (i%8 != 0) {
-                            MSG("\n");
-                        }
-                        MSG("--- end of payload ---\n");
-                    } else {
-                        /* update stats */
-                        pthread_mutex_lock(&mx_meas_dw);
-                        if (jit_result != JIT_ERROR_COLLISION_BEACON) {
-                            meas_nb_beacon_rejected += 1;
-                        }
-                        pthread_mutex_unlock(&mx_meas_dw);
-                        /* In case previous enqueue failed, we retry one period later until it succeeds */
-                        /* Note: In case the GPS has been unlocked for a while, there can be lots of retries */
-                        /*       to be done from last beacon time to a new valid one */
-                        retry++;
-                        MSG_DEBUG(DEBUG_BEACON, "--> beacon queuing retry=%d\n", retry);
-                    }
-                } else {
-                    pthread_mutex_unlock(&mx_timeref);
-                    break;
-                }
-            }
-
             /* if no network message was received, got back to listening sock_down socket */
             if (msg_len == -1) {
                 //MSG("WARNING: [down] recv returned %s\n", strerror(errno)); /* too verbose */
@@ -2034,8 +1659,7 @@ void thread_down(void) {
 
             /* if the datagram does not respect protocol, just ignore it */
             if ((msg_len < 4) || (buff_down[0] != PROTOCOL_VERSION) || ((buff_down[3] != PKT_PULL_RESP) && (buff_down[3] != PKT_PULL_ACK))) {
-                MSG("WARNING: [down] ignoring invalid packet len=%d, protocol_version=%d, id=%d\n",
-                        msg_len, buff_down[0], buff_down[3]);
+                MSG("WARNING: [down] ignoring invalid packet\n");
                 continue;
             }
 
@@ -2060,7 +1684,7 @@ void thread_down(void) {
 
             /* the datagram is a PULL_RESP */
             buff_down[msg_len] = 0; /* add string terminator, just to be safe */
-            MSG("INFO: [down] PULL_RESP received  - token[%d:%d] :)\n", buff_down[1], buff_down[2]); /* very verbose */
+            MSG("INFO: [down] PULL_RESP received :)\n"); /* very verbose */
             printf("\nJSON down: %s\n", (char *)(buff_down + 4)); /* DEBUG: display JSON payload */
 
             /* initialize TX struct and try to parse JSON */
@@ -2084,7 +1708,6 @@ void thread_down(void) {
             if (i == 1) {
                 /* TX procedure: send immediately */
                 sent_immediate = true;
-                downlink_type = JIT_PKT_TYPE_DOWNLINK_CLASS_C;
                 MSG("INFO: [down] a packet will be sent in \"immediate\" mode\n");
             } else {
                 sent_immediate = false;
@@ -2092,9 +1715,7 @@ void thread_down(void) {
                 if (val != NULL) {
                     /* TX procedure: send on timestamp value */
                     txpkt.count_us = (uint32_t)json_value_get_number(val);
-
-                    /* Concentrator timestamp is given, we consider it is a Class A downlink */
-                    downlink_type = JIT_PKT_TYPE_DOWNLINK_CLASS_A;
+                    MSG("INFO: [down] a packet will be sent on timestamp value %u\n", txpkt.count_us);
                 } else {
                     /* TX procedure: send on UTC time (converted to timestamp value) */
                     str = json_object_get_string(txpk_obj, "time");
@@ -2112,17 +1733,11 @@ void thread_down(void) {
                             pthread_mutex_unlock(&mx_timeref);
                             MSG("WARNING: [down] no valid GPS time reference yet, impossible to send packet on specific UTC time, TX aborted\n");
                             json_value_free(root_val);
-
-                            /* send acknoledge datagram to server */
-                            send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_GPS_UNLOCKED);
                             continue;
                         }
                     } else {
                         MSG("WARNING: [down] GPS disabled, impossible to send packet on specific UTC time, TX aborted\n");
                         json_value_free(root_val);
-
-                        /* send acknoledge datagram to server */
-                        send_tx_ack(buff_down[1], buff_down[2], JIT_ERROR_GPS_UNLOCKED);
                         continue;
                     }
 
@@ -2151,9 +1766,6 @@ void thread_down(void) {
                     } else {
                         MSG("INFO: [down] a packet will be sent on timestamp value %u (calculated from UTC time)\n", txpkt.count_us);
                     }
-
-                    /* GPS timestamp is given, we consider it is a Class B downlink */
-                    downlink_type = JIT_PKT_TYPE_DOWNLINK_CLASS_B;
                 }
             }
 
@@ -2184,7 +1796,7 @@ void thread_down(void) {
             /* parse TX power (optional field) */
             val = json_object_get_value(txpk_obj,"powe");
             if (val != NULL) {
-                txpkt.rf_power = (int8_t)json_value_get_number(val) - antenna_gain;
+                txpkt.rf_power = (int8_t)json_value_get_number(val);
             }
 
             /* Parse modulation (mandatory) */
@@ -2343,152 +1955,70 @@ void thread_down(void) {
                 txpkt.tx_mode = TIMESTAMPED;
             }
 
+            //txpkt.datarate txpkt.bandwidth
+            if(jp920_datarate == true){
+                if( txpkt.bandwidth != BW_125KHZ ){
+                    txpkt.freq_hz += 100000;
+                    txpkt.bandwidth = BW_250KHZ;
+                    txpkt.datarate = DR_LORA_SF7;
+                }else{
+                    switch( txpkt.datarate ){
+                        case DR_LORA_SF12:
+                            txpkt.datarate = DR_LORA_SF9;
+                            break;
+                        case DR_LORA_SF11:
+                            txpkt.datarate = DR_LORA_SF8;
+                            break;
+                        case DR_LORA_SF10:
+                            txpkt.datarate = DR_LORA_SF7;
+                            break;
+                        case DR_LORA_SF9:
+                        case DR_LORA_SF8:
+                        case DR_LORA_SF7:
+                        default:
+                            txpkt.freq_hz += 100000;
+                            txpkt.bandwidth = BW_250KHZ;
+                            txpkt.datarate = DR_LORA_SF7;
+                            break;
+                    }
+                }
+            }
+
             /* record measurement data */
             pthread_mutex_lock(&mx_meas_dw);
             meas_dw_dgram_rcv += 1; /* count only datagrams with no JSON errors */
             meas_dw_network_byte += msg_len; /* meas_dw_network_byte */
             meas_dw_payload_byte += txpkt.size;
-            pthread_mutex_unlock(&mx_meas_dw);
 
-            /* check TX parameter before trying to queue packet */
-            jit_result = JIT_ERROR_OK;
-            if ((txpkt.freq_hz < tx_freq_min[txpkt.rf_chain]) || (txpkt.freq_hz > tx_freq_max[txpkt.rf_chain])) {
-                jit_result = JIT_ERROR_TX_FREQ;
-                MSG("ERROR: Packet REJECTED, unsupported frequency - %u (min:%u,max:%u)\n", txpkt.freq_hz, tx_freq_min[txpkt.rf_chain], tx_freq_max[txpkt.rf_chain]);
-            }
-            if (jit_result == JIT_ERROR_OK) {
-                for (i=0; i<txlut.size; i++) {
-                    if (txlut.lut[i].rf_power == txpkt.rf_power) {
-                        /* this RF power is supported, we can continue */
-                        break;
-                    }
+            {
+                int k;
+                printf("TX: ");
+                for(k=0; k<txpkt.size; k++){
+                    printf("%02X ", txpkt.payload[k]);
                 }
-                if (i == txlut.size) {
-                    /* this RF power is not supported */
-                    jit_result = JIT_ERROR_TX_POWER;
-                    MSG("ERROR: Packet REJECTED, unsupported RF power for TX - %d\n", txpkt.rf_power);
-                }
+                printf("\n");
             }
 
-            /* insert packet to be sent into JIT queue */
-            if (jit_result == JIT_ERROR_OK) {
-                gettimeofday(&current_unix_time, NULL);
-                get_concentrator_time(&current_concentrator_time, current_unix_time);
-                jit_result = jit_enqueue(&jit_queue, &current_concentrator_time, &txpkt, downlink_type);
-                if (jit_result != JIT_ERROR_OK) {
-                    printf("ERROR: Packet REJECTED (jit error=%d)\n", jit_result);
-                }
-                pthread_mutex_lock(&mx_meas_dw);
-                meas_nb_tx_requested += 1;
+            /* transfer data and metadata to the concentrator, and schedule TX */
+            pthread_mutex_lock(&mx_concent); /* may have to wait for a fetch to finish */
+            i = lgw_send(txpkt);
+            pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
+            if (i == LGW_HAL_ERROR) {
+                meas_nb_tx_fail += 1;
+                pthread_mutex_unlock(&mx_meas_dw);
+                MSG("WARNING: [down] lgw_send failed\n");
+                continue;
+            } else {
+                meas_nb_tx_ok += 1;
                 pthread_mutex_unlock(&mx_meas_dw);
             }
-
-            /* Send acknoledge datagram to server */
-            send_tx_ack(buff_down[1], buff_down[2], jit_result);
         }
     }
     MSG("\nINFO: End of downstream thread\n");
 }
 
-void print_tx_status(uint8_t tx_status) {
-    switch (tx_status) {
-        case TX_OFF:
-            MSG("INFO: [jit] lgw_status returned TX_OFF\n");
-            break;
-        case TX_FREE:
-            MSG("INFO: [jit] lgw_status returned TX_FREE\n");
-            break;
-        case TX_EMITTING:
-            MSG("INFO: [jit] lgw_status returned TX_EMITTING\n");
-            break;
-        case TX_SCHEDULED:
-            MSG("INFO: [jit] lgw_status returned TX_SCHEDULED\n");
-            break;
-        default:
-            MSG("INFO: [jit] lgw_status returned UNKNOWN (%d)\n", tx_status);
-            break;
-    }
-}
-
-
 /* -------------------------------------------------------------------------- */
-/* --- THREAD 3: CHECKING PACKETS TO BE SENT FROM JIT QUEUE AND SEND THEM --- */
-
-void thread_jit(void) {
-    int result = LGW_HAL_SUCCESS;
-    struct lgw_pkt_tx_s pkt;
-    int pkt_index = -1;
-    struct timeval current_unix_time;
-    struct timeval current_concentrator_time;
-    enum jit_error_e jit_result;
-    enum jit_pkt_type_e pkt_type;
-    uint8_t tx_status;
-
-    while (!exit_sig && !quit_sig) {
-        wait_ms(10);
-
-        /* transfer data and metadata to the concentrator, and schedule TX */
-        gettimeofday(&current_unix_time, NULL);
-        get_concentrator_time(&current_concentrator_time, current_unix_time);
-        jit_result = jit_peek(&jit_queue, &current_concentrator_time, &pkt_index);
-        if (jit_result == JIT_ERROR_OK) {
-            if (pkt_index > -1) {
-                jit_result = jit_dequeue(&jit_queue, pkt_index, &pkt, &pkt_type);
-                if (jit_result == JIT_ERROR_OK) {
-                    /* update beacon stats */
-                    if (pkt_type == JIT_PKT_TYPE_BEACON) {
-                        pthread_mutex_lock(&mx_meas_dw);
-                        meas_nb_beacon_sent += 1;
-                        pthread_mutex_unlock(&mx_meas_dw);
-                    }
-
-                    /* check if concentrator is free for sending new packet */
-                    result = lgw_status(TX_STATUS, &tx_status);
-                    if (result == LGW_HAL_ERROR) {
-                        MSG("WARNING: [jit] lgw_status failed\n");
-                    } else {
-                        if (tx_status == TX_EMITTING) {
-                            MSG("ERROR: concentrator is currently emitting\n");
-                            print_tx_status(tx_status);
-                            continue;
-                        } else if (tx_status == TX_SCHEDULED) {
-                            MSG("WARNING: a downlink was already scheduled, overwritting it...\n");
-                            print_tx_status(tx_status);
-                        } else {
-                            /* Nothing to do */
-                        }
-                    }
-
-                    /* send packet to concentrator */
-                    pthread_mutex_lock(&mx_concent); /* may have to wait for a fetch to finish */
-                    result = lgw_send(pkt);
-                    pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
-                    if (result == LGW_HAL_ERROR) {
-                        pthread_mutex_lock(&mx_meas_dw);
-                        meas_nb_tx_fail += 1;
-                        pthread_mutex_unlock(&mx_meas_dw);
-                        MSG("WARNING: [jit] lgw_send failed\n");
-                        continue;
-                    } else {
-                        pthread_mutex_lock(&mx_meas_dw);
-                        meas_nb_tx_ok += 1;
-                        pthread_mutex_unlock(&mx_meas_dw);
-                        MSG_DEBUG(DEBUG_PKT_FWD, "lgw_send done: count_us=%u\n", pkt.count_us);
-                    }
-                } else {
-                    MSG("ERROR: jit_dequeue failed with %d\n", jit_result);
-                }
-            }
-        } else if (jit_result == JIT_ERROR_EMPTY) {
-            /* Do nothing, it can happen */
-        } else {
-            MSG("ERROR: jit_peek failed with %d\n", jit_result);
-        }
-    }
-}
-
-/* -------------------------------------------------------------------------- */
-/* --- THREAD 4: PARSE GPS MESSAGE AND KEEP GATEWAY IN SYNC ----------------- */
+/* --- THREAD 3: PARSE GPS MESSAGE AND KEEP GATEWAY IN SYNC ----------------- */
 
 void thread_gps(void) {
     int i;
@@ -2567,31 +2097,12 @@ void thread_gps(void) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* --- THREAD 5: CHECK TIME REFERENCE AND CALCULATE XTAL CORRECTION --------- */
+/* --- THREAD 4: CHECK TIME REFERENCE AND CALCULATE XTAL CORRECTION --------- */
 
 void thread_valid(void) {
 
     /* GPS reference validation variables */
     long gps_ref_age = 0;
-    bool ref_valid_local = false;
-    double xtal_err_cpy;
-
-    /* variables for XTAL correction averaging */
-    unsigned init_cpt = 0;
-    double init_acc = 0.0;
-    double x;
-
-    /* correction debug */
-    // FILE * log_file = NULL;
-    // time_t now_time;
-    // char log_name[64];
-
-    /* initialization */
-    // time(&now_time);
-    // strftime(log_name,sizeof log_name,"xtal_err_%Y%m%dT%H%M%SZ.csv",localtime(&now_time));
-    // log_file = fopen(log_name, "w");
-    // setbuf(log_file, NULL);
-    // fprintf(log_file,"\"xtal_correct\",\"XERR_INIT_AVG %u XERR_FILT_COEF %u\"\n", XERR_INIT_AVG, XERR_FILT_COEF); // DEBUG
 
     /* main loop task */
     while (!exit_sig && !quit_sig) {
@@ -2603,47 +2114,12 @@ void thread_valid(void) {
         if ((gps_ref_age >= 0) && (gps_ref_age <= GPS_REF_MAX_AGE)) {
             /* time ref is ok, validate and  */
             gps_ref_valid = true;
-            ref_valid_local = true;
-            xtal_err_cpy = time_reference_gps.xtal_err;
         } else {
             /* time ref is too old, invalidate */
             gps_ref_valid = false;
-            ref_valid_local = false;
         }
         pthread_mutex_unlock(&mx_timeref);
 
-        /* manage XTAL correction */
-        if (ref_valid_local == false) {
-            /* couldn't sync, or sync too old -> invalidate XTAL correction */
-            pthread_mutex_lock(&mx_xcorr);
-            xtal_correct_ok = false;
-            xtal_correct = 1.0;
-            pthread_mutex_unlock(&mx_xcorr);
-            init_cpt = 0;
-            init_acc = 0.0;
-        } else {
-            if (init_cpt < XERR_INIT_AVG) {
-                /* initial accumulation */
-                init_acc += xtal_err_cpy;
-                ++init_cpt;
-            } else if (init_cpt == XERR_INIT_AVG) {
-                /* initial average calculation */
-                pthread_mutex_lock(&mx_xcorr);
-                xtal_correct = (double)(XERR_INIT_AVG) / init_acc;
-                xtal_correct_ok = true;
-                pthread_mutex_unlock(&mx_xcorr);
-                ++init_cpt;
-                // fprintf(log_file,"%.18lf,\"average\"\n", xtal_correct); // DEBUG
-            } else {
-                /* tracking with low-pass filter */
-                x = 1 / xtal_err_cpy;
-                pthread_mutex_lock(&mx_xcorr);
-                xtal_correct = xtal_correct - xtal_correct/XERR_FILT_COEF + x/XERR_FILT_COEF;
-                pthread_mutex_unlock(&mx_xcorr);
-                // fprintf(log_file,"%.18lf,\"track\"\n", xtal_correct); // DEBUG
-            }
-        }
-        // printf("Time ref: %s, XTAL correct: %s (%.15lf)\n", ref_valid_local?"valid":"invalid", xtal_correct_ok?"valid":"invalid", xtal_correct); // DEBUG
     }
     MSG("\nINFO: End of validation thread\n");
 }
