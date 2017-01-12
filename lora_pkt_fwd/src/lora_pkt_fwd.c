@@ -904,7 +904,6 @@ static int send_tx_ack(uint8_t token_h, uint8_t token_l, enum jit_error_e error)
 
 /* -------------------------------------------------------------------------- */
 /* --- MAIN FUNCTION -------------------------------------------------------- */
-
 int main(void)
 {
     struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
@@ -1704,6 +1703,15 @@ void thread_up(void) {
                 exit(EXIT_FAILURE);
             }
 
+            {
+                int k;
+                printf("RX: ");
+                for(k=0; k<p->size; k++){
+                    printf("%02X ", p->payload[k]);
+                }
+                printf("\n");
+            }
+
             /* Packet base64-encoded payload, 14-350 useful chars */
             memcpy((void *)(buff_up + buff_index), (void *)",\"data\":\"", 9);
             buff_index += 9;
@@ -1800,6 +1808,82 @@ void thread_up(void) {
 
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 2: POLLING SERVER AND ENQUEUING PACKETS IN JIT QUEUE ---------- */
+
+void set_beacon_pl(struct lgw_pkt_tx_s *beacon_pkt, uint8_t type, uint32_t timeval)
+{
+    /* beacon data fields, byte 0 is Least Significant Byte */
+    uint8_t field_info = 0;
+    int32_t field_latitude; /* 3 bytes, derived from reference latitude */
+    int32_t field_longitude; /* 3 bytes, derived from reference longitude */
+    uint16_t field_crc1, field_crc2;
+
+    /* calculate the latitude and longitude that must be publicly reported */
+    field_latitude = (int32_t)((reference_coord.lat / 90.0) * (double)(1<<23));
+    if (field_latitude > (int32_t)0x007FFFFF) {
+        field_latitude = (int32_t)0x007FFFFF; /* +90 N is represented as 89.99999 N */
+    } else if (field_latitude < (int32_t)0xFF800000) {
+        field_latitude = (int32_t)0xFF800000;
+    }
+    field_longitude = 0x00FFFFFF & (int32_t)((reference_coord.lon / 180.0) * (double)(1<<23)); /* +180 = -180 = 0x800000 */
+
+    if(type == 0){
+        /* fixed bacon fields (little endian) */
+        beacon_pkt->payload[0] = 0x0; /* RFU */
+        beacon_pkt->payload[1] = 0x0; /* RFU */
+
+        /* load time in beacon payload */
+        beacon_pkt->payload[2] = 0xFF &  timeval;
+        beacon_pkt->payload[3] = 0xFF & (timeval >>  8);
+        beacon_pkt->payload[4] = 0xFF & (timeval >> 16);
+        beacon_pkt->payload[5] = 0xFF & (timeval >> 24);
+
+        /* calculate CRC */
+        field_crc1 = crc16(beacon_pkt->payload, 6); /* CRC for the first 6 bytes */
+        beacon_pkt->payload[6] = 0xFF & field_crc1;
+        beacon_pkt->payload[7] = 0xFF & (field_crc1 >> 8);
+
+        /* optional beacon fields */
+        beacon_pkt->payload[ 8] = field_info;
+        beacon_pkt->payload[ 9] = 0xFF &  field_latitude;
+        beacon_pkt->payload[10] = 0xFF & (field_latitude >>  8);
+        beacon_pkt->payload[11] = 0xFF & (field_latitude >> 16);
+        beacon_pkt->payload[12] = 0xFF &  field_longitude;
+        beacon_pkt->payload[13] = 0xFF & (field_longitude >>  8);
+        beacon_pkt->payload[14] = 0xFF & (field_longitude >> 16);
+
+        /* CRC of the optional beacon fileds */
+        field_crc2 = crc16((beacon_pkt->payload + 8), 7);
+        beacon_pkt->payload[15] = 0xFF &  field_crc2;
+        beacon_pkt->payload[16] = 0xFF & (field_crc2 >>  8);
+    }else{
+        /* NetId */
+        beacon_pkt->payload[0] = 0x0; /* RFU */
+        beacon_pkt->payload[1] = 0x0; /* RFU */
+        beacon_pkt->payload[2] = 0x0; /* RFU */
+
+        /* load time in beacon payload */
+        beacon_pkt->payload[3] = 0xFF &  timeval;
+        beacon_pkt->payload[4] = 0xFF & (timeval >>  8);
+        beacon_pkt->payload[5] = 0xFF & (timeval >> 16);
+        beacon_pkt->payload[6] = 0xFF & (timeval >> 24);
+        field_crc1 = crc16(beacon_pkt->payload, 7); /* CRC for the first 6 bytes */
+        beacon_pkt->payload[7] = 0xFF & field_crc1;
+
+        /* optional beacon fields */
+        beacon_pkt->payload[ 8] = field_info;
+        beacon_pkt->payload[ 9] = 0xFF &  field_latitude;
+        beacon_pkt->payload[10] = 0xFF & (field_latitude >>  8);
+        beacon_pkt->payload[11] = 0xFF & (field_latitude >> 16);
+        beacon_pkt->payload[12] = 0xFF &  field_longitude;
+        beacon_pkt->payload[13] = 0xFF & (field_longitude >>  8);
+        beacon_pkt->payload[14] = 0xFF & (field_longitude >> 16);
+
+        /* CRC of the optional beacon fileds */
+        field_crc2 = crc16((beacon_pkt->payload + 8), 7);
+        beacon_pkt->payload[15] = 0xFF &  field_crc2;
+        beacon_pkt->payload[16] = 0xFF & (field_crc2 >>  8);
+    }
+}
 
 void thread_down(void) {
     int i; /* loop variables */
@@ -2001,6 +2085,9 @@ void thread_down(void) {
                     field_crc1 = crc16(beacon_pkt.payload, 6); /* CRC for the first 6 bytes */
                     beacon_pkt.payload[6] = 0xFF & field_crc1;
                     beacon_pkt.payload[7] = 0xFF & (field_crc1 >> 8);
+
+                    //set_beacon_pl(&beacon_pkt, 0, next_beacon_gps_time.tv_sec);
+                    set_beacon_pl(&beacon_pkt, 1, next_beacon_gps_time.tv_sec);
 
                     /* Insert beacon packet in JiT queue */
                     gettimeofday(&current_unix_time, NULL);
@@ -2382,14 +2469,27 @@ void thread_down(void) {
             }
             if (jit_result == JIT_ERROR_OK) {
                 for (i=0; i<txlut.size; i++) {
+                    if(i == (txlut.size - 1)){
+                        if(txlut.lut[i].rf_power < txpkt.rf_power){
+                            break;
+                        }
+                    }
                     if (txlut.lut[i].rf_power == txpkt.rf_power) {
                         /* this RF power is supported, we can continue */
                         break;
+                    }else if(txlut.lut[i].rf_power > txpkt.rf_power){
+                        if(i==0){
+                            i = txlut.size;
+                            break;
+                        }else{
+                            i--;
+                            break;
+                        }
                     }
                 }
                 if (i == txlut.size) {
                     /* this RF power is not supported */
-                    jit_result = JIT_ERROR_TX_POWER;
+                    // jit_result = JIT_ERROR_TX_POWER;
                     MSG("ERROR: Packet REJECTED, unsupported RF power for TX - %d\n", txpkt.rf_power);
                 }
             }
@@ -2483,6 +2583,15 @@ void thread_jit(void) {
                         }
                     }
 
+                    {
+                        int k;
+                        printf("TX: ");
+                        for(k=0; k<pkt.size; k++){
+                            printf("%02X ", pkt.payload[k]);
+                        }
+                        printf("\n");
+                    }
+
                     /* send packet to concentrator */
                     pthread_mutex_lock(&mx_concent); /* may have to wait for a fetch to finish */
                     result = lgw_send(pkt);
@@ -2557,7 +2666,9 @@ void thread_gps(void) {
 
             /* get timestamp captured on PPM pulse  */
             pthread_mutex_lock(&mx_concent);
+            lgw_reg_w(LGW_GPS_EN, 0);
             i = lgw_get_trigcnt(&trig_tstamp);
+            lgw_reg_w(LGW_GPS_EN, 1);
             pthread_mutex_unlock(&mx_concent);
             if (i != LGW_HAL_SUCCESS) {
                 MSG("WARNING: [gps] failed to read concentrator timestamp\n");
