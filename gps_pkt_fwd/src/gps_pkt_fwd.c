@@ -59,6 +59,7 @@ Maintainer: Sylvain Miermont
 #define STRINGIFY(x)    #x
 #define STR(x)          STRINGIFY(x)
 #define MSG(args...)    printf(args) /* message that is destined to the user */
+#define MSGACK(args...)
 #define TRACE()         fprintf(stderr, "@ %s %d\n", __FUNCTION__, __LINE__);
 
 /* -------------------------------------------------------------------------- */
@@ -745,6 +746,7 @@ int main(void)
 {
     struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
     int i; /* loop variable and temporary variable for return value */
+    uint32_t j;
 
     /* configuration file related */
     char *global_cfg_path= "global_conf.json"; /* contain global (typ. network-wide) configuration */
@@ -972,7 +974,12 @@ int main(void)
     /* main loop task : statistics collection */
     while (!exit_sig && !quit_sig) {
         /* wait for next reporting interval */
-        wait_ms(1000 * stat_interval);
+        for( j=0; j<stat_interval; j++){
+            wait_ms(1000);
+            if (exit_sig || quit_sig) {
+                break;
+            }
+        }
 
         /* get timestamp for statistics */
         t = time(NULL);
@@ -1194,11 +1201,16 @@ void thread_up(void) {
         /* fetch packets */
         pthread_mutex_lock(&mx_concent);
         nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
-       if(lgw_check()<0){
-           if(lgw_start() == LGW_HAL_SUCCESS) {
-               MSG("LORA RESTART\n");
-           }
-       }
+        if(lgw_check()<0){
+            if(lgw_stop() == LGW_HAL_SUCCESS) {
+                MSG("LORA STOP\n");
+            }
+            wait_ms(1000);
+            if(lgw_start() == LGW_HAL_SUCCESS) {
+                MSG("LORA START\n");
+            }
+            nb_pkt = 0;
+        }
         pthread_mutex_unlock(&mx_concent);
         if (nb_pkt == LGW_HAL_ERROR) {
             MSG("ERROR: [up] failed packet fetch, exiting\n");
@@ -1529,7 +1541,7 @@ void thread_up(void) {
         ++buff_index;
         buff_up[buff_index] = 0; /* add string terminator, for safety */
 
-        printf("\nJSON up: %s\n", (char *)(buff_up + 12)); /* DEBUG: display JSON payload */
+        printf("JSON up: %s\n", (char *)(buff_up + 12)); /* DEBUG: display JSON payload */
 
         /* send datagram to server */
         send(sock_up, (void *)buff_up, buff_index, 0);
@@ -1555,7 +1567,7 @@ void thread_up(void) {
                 //MSG("WARNING: [up] ignored out-of sync ACK packet\n");
                 continue;
             } else {
-                MSG("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
+                MSGACK("INFO: [up] PUSH_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
                 meas_up_ack_rcv += 1;
                 break;
             }
@@ -1674,7 +1686,7 @@ void thread_down(void) {
                         pthread_mutex_lock(&mx_meas_dw);
                         meas_dw_ack_rcv += 1;
                         pthread_mutex_unlock(&mx_meas_dw);
-                        MSG("INFO: [down] PULL_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
+                        MSGACK("INFO: [down] PULL_ACK received in %i ms\n", (int)(1000 * difftimespec(recv_time, send_time)));
                     }
                 } else { /* out-of-sync token */
                     MSG("INFO: [down] received out-of-sync ACK\n");
@@ -1684,21 +1696,21 @@ void thread_down(void) {
 
             /* the datagram is a PULL_RESP */
             buff_down[msg_len] = 0; /* add string terminator, just to be safe */
-            MSG("INFO: [down] PULL_RESP received :)\n"); /* very verbose */
-            printf("\nJSON down: %s\n", (char *)(buff_down + 4)); /* DEBUG: display JSON payload */
+            MSGACK("INFO: [down] PULL_RESP received :)\n"); /* very verbose */
+            printf("JSON down: %s\n", (char *)(buff_down + 4)); /* DEBUG: display JSON payload */
 
             /* initialize TX struct and try to parse JSON */
             memset(&txpkt, 0, sizeof txpkt);
             root_val = json_parse_string_with_comments((const char *)(buff_down + 4)); /* JSON offset */
             if (root_val == NULL) {
-                MSG("WARNING: [down] invalid JSON, TX aborted\n");
+                MSGACK("WARNING: [down] invalid JSON, TX aborted\n");
                 continue;
             }
 
             /* look for JSON sub-object 'txpk' */
             txpk_obj = json_object_get_object(json_value_get_object(root_val), "txpk");
             if (txpk_obj == NULL) {
-                MSG("WARNING: [down] no \"txpk\" object in JSON, TX aborted\n");
+                MSGACK("WARNING: [down] no \"txpk\" object in JSON, TX aborted\n");
                 json_value_free(root_val);
                 continue;
             }
@@ -1708,19 +1720,19 @@ void thread_down(void) {
             if (i == 1) {
                 /* TX procedure: send immediately */
                 sent_immediate = true;
-                MSG("INFO: [down] a packet will be sent in \"immediate\" mode\n");
+                MSGACK("INFO: [down] a packet will be sent in \"immediate\" mode\n");
             } else {
                 sent_immediate = false;
                 val = json_object_get_value(txpk_obj,"tmst");
                 if (val != NULL) {
                     /* TX procedure: send on timestamp value */
                     txpkt.count_us = (uint32_t)json_value_get_number(val);
-                    MSG("INFO: [down] a packet will be sent on timestamp value %u\n", txpkt.count_us);
+                    MSGACK("INFO: [down] a packet will be sent on timestamp value %u\n", txpkt.count_us);
                 } else {
                     /* TX procedure: send on UTC time (converted to timestamp value) */
                     str = json_object_get_string(txpk_obj, "time");
                     if (str == NULL) {
-                        MSG("WARNING: [down] no mandatory \"txpk.tmst\" or \"txpk.time\" objects in JSON, TX aborted\n");
+                        MSGACK("WARNING: [down] no mandatory \"txpk.tmst\" or \"txpk.time\" objects in JSON, TX aborted\n");
                         json_value_free(root_val);
                         continue;
                     }

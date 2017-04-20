@@ -2086,8 +2086,8 @@ void thread_down(void) {
                     beacon_pkt.payload[6] = 0xFF & field_crc1;
                     beacon_pkt.payload[7] = 0xFF & (field_crc1 >> 8);
 
-                    //set_beacon_pl(&beacon_pkt, 0, next_beacon_gps_time.tv_sec);
-                    set_beacon_pl(&beacon_pkt, 1, next_beacon_gps_time.tv_sec);
+                    set_beacon_pl(&beacon_pkt, 0, next_beacon_gps_time.tv_sec);
+                    //set_beacon_pl(&beacon_pkt, 1, next_beacon_gps_time.tv_sec);
 
                     /* Insert beacon packet in JiT queue */
                     gettimeofday(&current_unix_time, NULL);
